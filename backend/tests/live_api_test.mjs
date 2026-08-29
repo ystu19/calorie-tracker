@@ -1,0 +1,14 @@
+const base=process.env.API_BASE_URL||"http://127.0.0.1:8000",stamp=`stage6-e2e-${Date.now()}`;
+const foodIds=[],recordIds=[];
+async function req(path,options={}){const r=await fetch(base+path,options);return{status:r.status,body:r.status===204?null:await r.json()}}
+const json=(method,body)=>({method,headers:{"content-type":"application/json"},body:JSON.stringify(body)});const ok=(v,m)=>{if(!v)throw new Error(m)};
+try{
+ const originalRecords=(await req("/api/records")).body.map(x=>x.id),originalFoods=(await req("/api/foods?limit=100")).body.map(x=>x.id);
+ const definitions=[{name:`${stamp}-g`,base_amount:100,unit:"g",protein:30,fat:3,carbs:0},{name:`${stamp}-个`,base_amount:1,unit:"个",protein:6,fat:5,carbs:.5},{name:`${stamp}-份`,base_amount:1,unit:"份",protein:4,fat:2,carbs:30}];
+ for(const d of definitions){const x=await req("/api/foods",json("POST",d));ok(x.status===201,`create ${d.unit}`);foodIds.push(x.body.id);ok(x.body.calories===d.protein*4+d.fat*9+d.carbs*4,"automatic calories")}
+ const search=await req(`/api/foods?search=${stamp}&limit=2`);ok(search.body.length===2,"limited search");const category=await req("/api/foods?category=蛋白质&limit=100");ok(category.body.some(x=>x.id===foodIds[0]),"category filter");
+ const rec=await req("/api/records",json("POST",{food_name:definitions[1].name,food_id:foodIds[1],quantity:2,unit:"个",meal_type:"早餐",eaten_at:new Date().toISOString()}));ok(rec.status===201&&rec.body.protein===12,"unit scaling");recordIds.push(rec.body.id);
+ const changed=await req(`/api/records/${rec.body.id}`,json("PUT",{food_name:definitions[1].name,food_id:foodIds[1],quantity:1,unit:"个",meal_type:"午餐",eaten_at:new Date().toISOString()}));ok(changed.body.protein===6&&changed.body.calories===71,"edit recalculation");
+ const manual={food_name:`${stamp}-auto`,quantity:1,unit:"份",protein:5,fat:2,carbs:20,nutrition_source:"ai_estimated",add_to_library:true,meal_type:"加餐",eaten_at:new Date().toISOString()};const added=await req("/api/records",json("POST",manual));recordIds.push(added.body.id);foodIds.push(added.body.food_id);const duplicate=await req("/api/records",json("POST",{...manual,food_name:` ${stamp}-auto `}));recordIds.push(duplicate.body.id);ok(duplicate.body.food_id===added.body.food_id,"normalized duplicate prevention");const stored=await req(`/api/foods/${added.body.food_id}`);ok(stored.body.estimated===true,"estimated marker");
+ ok(originalRecords.every(id=>!recordIds.includes(id))&&originalFoods.every(id=>!foodIds.includes(id)),"test IDs overlap existing data");console.log("PASS: units, kcal, scaling, edit, search, category, auto-add, duplicate prevention, estimated marker");
+}finally{for(const id of recordIds.reverse())await req(`/api/records/${id}`,{method:"DELETE"});for(const id of [...new Set(foodIds)].reverse())await req(`/api/foods/${id}`,{method:"DELETE"});console.log("CLEANUP: removed only stage6 exact IDs")}
