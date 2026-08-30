@@ -3,6 +3,8 @@ from pathlib import Path
 from sqlalchemy import Engine, create_engine, inspect, text
 from sqlalchemy.orm import DeclarativeBase, sessionmaker
 
+from app.normalization import normalize_food_name
+
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -79,10 +81,11 @@ def migrate_database(target_engine: Engine = engine) -> None:
         connection.execute(text("UPDATE foods SET base_amount = 100 WHERE base_amount IS NULL OR base_amount <= 0"))
         connection.execute(text("UPDATE foods SET unit = 'g' WHERE unit IS NULL OR unit = ''"))
         connection.execute(text("UPDATE foods SET nutrition_source = 'manual' WHERE nutrition_source IS NULL OR nutrition_source = ''"))
-        rows = connection.execute(text("SELECT id, name FROM foods WHERE normalized_name IS NULL OR normalized_name = ''")).all()
-        for food_id, name in rows:
-            normalized = "".join(str(name).strip().lower().split())
-            connection.execute(text("UPDATE foods SET normalized_name=:name WHERE id=:id"), {"name": normalized, "id": food_id})
+        rows = connection.execute(text("SELECT id, name, normalized_name FROM foods")).all()
+        for food_id, name, stored_name in rows:
+            normalized = normalize_food_name(str(name))
+            if stored_name != normalized:
+                connection.execute(text("UPDATE foods SET normalized_name=:name WHERE id=:id"), {"name": normalized, "id": food_id})
         if has_goals:
             connection.execute(text("UPDATE daily_goals SET calories_goal=calories, carbs_goal=carbs, protein_goal=protein, fat_goal=fat WHERE weight_kg IS NULL"))
 

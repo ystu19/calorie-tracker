@@ -1,11 +1,57 @@
 <script setup>
 import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { FOOD_CATEGORY_FILTERS, foodCategoryLabels } from "../utils/foodCategories.js";
-const props=defineProps({selectedId:{type:[Number,String],default:""},placeholder:{type:String,default:"搜索食物名称"}}),emit=defineEmits(["select","clear"]);const query=ref(""),category=ref(""),results=ref([]),open=ref(false),loading=ref(false),error=ref(""),root=ref(null);let timer,suppressQuerySearch=false,usagePromise=null,searchRequestId=0;const usage=new Map();
-async function loadUsage(){if(usagePromise)return usagePromise;usagePromise=fetch("/api/records").then(async response=>{if(!response.ok)return;const cutoff=Date.now()-30*24*60*60*1000;for(const record of await response.json()){if(!record.food_id)continue;const usedAt=new Date(record.eaten_at).getTime(),current=usage.get(Number(record.food_id))||{recentCount:0,lastUsed:0};if(usedAt>=cutoff)current.recentCount+=1;if(usedAt>current.lastUsed)current.lastUsed=usedAt;usage.set(Number(record.food_id),current)}}).catch(()=>{});return usagePromise}
-function sortByUsage(foods){return [...foods].sort((a,b)=>{const left=usage.get(Number(a.id))||{recentCount:0,lastUsed:0},right=usage.get(Number(b.id))||{recentCount:0,lastUsed:0};return right.recentCount-left.recentCount||right.lastUsed-left.lastUsed||a.name.localeCompare(b.name,"zh-CN")})}
-async function searchFoods(showResults=true){const requestId=++searchRequestId;loading.value=true;error.value="";const params=new URLSearchParams({limit:"100"});if(query.value.trim())params.set("search",query.value.trim());if(category.value)params.set("primary_category",category.value);try{const foods=[];let offset=0;const usageLoad=loadUsage();while(true){if(requestId!==searchRequestId)return;params.set("offset",String(offset));const response=await fetch(`/api/foods?${params}`);if(!response.ok)throw new Error("食物搜索失败");const page=await response.json();foods.push(...page);if(page.length<100)break;offset+=page.length}await usageLoad;if(requestId!==searchRequestId)return;results.value=sortByUsage(foods).slice(0,20);if(showResults)open.value=true}catch(reason){if(requestId===searchRequestId){results.value=[];error.value=reason.message||"食物搜索失败";if(showResults)open.value=true}}finally{if(requestId===searchRequestId)loading.value=false}}
-function choose(food){suppressQuerySearch=true;clearTimeout(timer);query.value=food.name;open.value=false;emit("select",food)}function clear(){suppressQuerySearch=true;query.value="";emit("clear");searchFoods()}function closeOnOutside(event){if(root.value&&!root.value.contains(event.target))open.value=false}function closeOnEscape(){open.value=false}
-watch(query,()=>{if(suppressQuerySearch){suppressQuerySearch=false;return}clearTimeout(timer);timer=setTimeout(searchFoods,180)});watch(category,()=>{clearTimeout(timer);timer=setTimeout(searchFoods,80)});watch(()=>props.selectedId,value=>{if(!value){clearTimeout(timer);if(query.value){suppressQuerySearch=true;query.value=""}open.value=false}});onMounted(()=>{searchFoods(false);document.addEventListener("pointerdown",closeOnOutside)});onBeforeUnmount(()=>{clearTimeout(timer);document.removeEventListener("pointerdown",closeOnOutside)});
+import { onFoodUsageChanged } from "../utils/foodUsage.js";
+
+const props = defineProps({ selectedId: { type: [Number, String], default: "" }, placeholder: { type: String, default: "搜索食物名称" } });
+const emit = defineEmits(["select", "clear"]);
+const query = ref("");
+const category = ref("");
+const results = ref([]);
+const open = ref(false);
+const loading = ref(false);
+const error = ref("");
+const root = ref(null);
+let timer, searchController, removeUsageListener;
+let suppressQuerySearch = false;
+let searchRequestId = 0;
+
+async function searchFoods(showResults = true) {
+  const requestId = ++searchRequestId;
+  searchController?.abort();
+  searchController = new AbortController();
+  loading.value = true;
+  error.value = "";
+  const params = new URLSearchParams({ limit: "20", offset: "0", sort: "usage" });
+  if (query.value.trim()) params.set("search", query.value.trim());
+  if (category.value) params.set("primary_category", category.value);
+  try {
+    const response = await fetch(`/api/foods?${params}`, { signal: searchController.signal });
+    if (!response.ok) throw new Error("食物搜索失败");
+    const foods = await response.json();
+    if (requestId !== searchRequestId) return;
+    results.value = foods;
+    if (showResults) open.value = true;
+  } catch (reason) {
+    if (reason.name !== "AbortError" && requestId === searchRequestId) {
+      results.value = [];
+      error.value = reason.message || "食物搜索失败";
+      if (showResults) open.value = true;
+    }
+  } finally {
+    if (requestId === searchRequestId) loading.value = false;
+  }
+}
+
+function choose(food) { suppressQuerySearch = true; clearTimeout(timer); query.value = food.name; open.value = false; emit("select", food); }
+function clear() { suppressQuerySearch = true; query.value = ""; emit("clear"); searchFoods(); }
+function closeOnOutside(event) { if (root.value && !root.value.contains(event.target)) open.value = false; }
+function closeOnEscape() { open.value = false; }
+
+watch(query, () => { if (suppressQuerySearch) { suppressQuerySearch = false; return; } clearTimeout(timer); timer = setTimeout(searchFoods, 180); });
+watch(category, () => { clearTimeout(timer); timer = setTimeout(searchFoods, 80); });
+watch(() => props.selectedId, value => { if (!value) { clearTimeout(timer); if (query.value) { suppressQuerySearch = true; query.value = ""; } open.value = false; } });
+onMounted(() => { searchFoods(false); removeUsageListener = onFoodUsageChanged(() => searchFoods(false)); document.addEventListener("pointerdown", closeOnOutside); });
+onBeforeUnmount(() => { clearTimeout(timer); searchController?.abort(); removeUsageListener?.(); document.removeEventListener("pointerdown", closeOnOutside); });
 </script>
 <template><div ref="root" class="food-picker" @keydown.esc="closeOnEscape"><div class="picker-row"><input v-model="query" :placeholder="placeholder" @pointerdown="open=true;searchFoods()"/><button v-if="selectedId" type="button" class="text-button" @click="clear">清除</button></div><div v-if="open" class="picker-results"><div class="category-filter"><button v-for="item in FOOD_CATEGORY_FILTERS" :key="item||'all'" type="button" :class="{active:category===item}" @click.stop="category=item">{{item||'全部'}}</button></div><p v-if="loading">搜索中…</p><p v-else-if="error" class="error">{{error}}</p><p v-else-if="!results.length">没有匹配食物</p><button v-for="food in results" :key="food.id" type="button" @pointerdown.prevent="choose(food)"><strong>{{food.name}}</strong><span>{{food.base_amount}}{{food.unit}} · {{food.calories}} kcal</span><small>{{foodCategoryLabels(food).join(' / ')}} · C {{food.carbs}} / P {{food.protein}} / F {{food.fat}} <template v-if="food.alcohol_abv>0">· {{food.alcohol_abv}}% vol </template><i v-if="food.estimated">估算</i></small></button></div></div></template>

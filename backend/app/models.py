@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Float, Integer, String
+from sqlalchemy import Boolean, DateTime, Float, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -61,3 +61,11 @@ class DailyGoal(Base):
     carbs_goal: Mapped[float] = mapped_column(Float, nullable=False, default=175)
     protein_goal: Mapped[float] = mapped_column(Float, nullable=False, default=84)
     fat_goal: Mapped[float] = mapped_column(Float, nullable=False, default=56)
+
+
+class RecordBatchRequest(Base):
+    __tablename__ = "record_batch_requests"
+
+    request_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    record_ids: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, nullable=False)

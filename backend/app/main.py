@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import math
 import os
 import re
@@ -12,13 +13,14 @@ from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from sqlalchemy import func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.ai_service import parse_food_text
 from app.database import get_db, init_db
-from app.models import DailyGoal, Food, FoodRecord
+from app.models import DailyGoal, Food, FoodRecord, RecordBatchRequest
+from app.normalization import normalize_food_name
 from app.schemas import (AIParseRequest, AIParsedItem, AIParseResponse, DailyGoalResponse,
                          DailyGoalUpdate, DailyStats, FoodCreate, FoodRecordBatchCreate, FoodRecordCreate,
                          FoodRecordResponse, FoodResponse, TrendPoint, UnlockRequest)
@@ -28,6 +30,9 @@ load_dotenv()
 UNITS = {"g", "ml", "个", "份"}
 EDIT_COOKIE = "calorie_edit_session"
 EDIT_SESSION_SECONDS = 30 * 24 * 60 * 60
+UNLOCK_WINDOW_SECONDS = 60
+UNLOCK_MAX_FAILURES = 5
+unlock_failures: dict[str, list[float]] = {}
 
 
 @asynccontextmanager
@@ -71,10 +76,6 @@ async def require_edit_session(request: Request, call_next):
     if protected and not auth_endpoint and not valid_session_token(request.cookies.get(EDIT_COOKIE)):
         return JSONResponse(status_code=401, content={"detail": "需要输入编辑密码后才能修改数据"})
     return await call_next(request)
-
-
-def normalize_food_name(value: str) -> str:
-    return re.sub(r"[\W_]+", "", value.strip().casefold(), flags=re.UNICODE)
 
 
 def calories_from_macros(protein: float, fat: float, carbs: float) -> float:
@@ -121,6 +122,14 @@ def food_primary_category(food: Food) -> str:
 def day_bounds(value: date) -> tuple[datetime, datetime]:
     start = datetime.combine(value, time.min)
     return start, start + timedelta(days=1)
+
+
+def default_meal_type(value: datetime) -> str:
+    hour = value.hour
+    if 5 <= hour <= 10: return "早餐"
+    if 11 <= hour <= 13: return "午餐"
+    if 17 <= hour <= 20: return "晚餐"
+    return "加餐"
 
 
 def record_for_date_statement(value: date):
@@ -244,10 +253,17 @@ def auth_status(request: Request) -> dict[str, bool]:
 
 
 @app.post("/api/auth/unlock")
-def unlock(payload: UnlockRequest, response: Response) -> dict[str, bool]:
+def unlock(payload: UnlockRequest, response: Response, request: Request) -> dict[str, bool]:
     password = edit_password()
     if not password: raise HTTPException(503, "后端尚未配置 EDIT_PASSWORD")
-    if not hmac.compare_digest(payload.password, password): raise HTTPException(401, "密码错误")
+    now = epoch_time.time(); client = request.client.host if request.client else "unknown"
+    failures = [value for value in unlock_failures.get(client, []) if now - value < UNLOCK_WINDOW_SECONDS]
+    if len(failures) >= UNLOCK_MAX_FAILURES:
+        raise HTTPException(429, "密码尝试过于频繁，请稍后再试")
+    if not hmac.compare_digest(payload.password.encode("utf-8"), password.encode("utf-8")):
+        failures.append(now); unlock_failures[client] = failures
+        raise HTTPException(401, "密码错误")
+    unlock_failures.pop(client, None)
     response.set_cookie(
         EDIT_COOKIE, create_session_token(), max_age=EDIT_SESSION_SECONDS,
         httponly=True, samesite="lax", secure=os.getenv("COOKIE_SECURE", "").lower() in {"1", "true", "yes"}, path="/",
@@ -261,19 +277,21 @@ def lock(response: Response) -> dict[str, bool]:
     return {"unlocked": False}
 
 
-def get_daily_goal(db: Session) -> DailyGoal:
+def get_daily_goal(db: Session, persist: bool = False) -> DailyGoal:
     goal = db.get(DailyGoal, 1)
     if goal is None:
         values = goal_values(70, 2.5, 1.2, 0.8)
-        goal = DailyGoal(id=1, weight_kg=70, calories=values["calories"], protein=values["protein"], fat=values["fat"], carbs=values["carbs"], calories_goal=values["calories"], protein_goal=values["protein"], fat_goal=values["fat"], carbs_goal=values["carbs"])
-        db.add(goal); db.commit(); db.refresh(goal)
+        goal = DailyGoal(id=1, weight_kg=70, carbs_per_kg=2.5, protein_per_kg=1.2, fat_per_kg=0.8, calories=values["calories"], protein=values["protein"], fat=values["fat"], carbs=values["carbs"], calories_goal=values["calories"], protein_goal=values["protein"], fat_goal=values["fat"], carbs_goal=values["carbs"])
+        if persist:
+            db.add(goal); db.flush()
     elif goal.weight_kg is not None:
         values = goal_values(goal.weight_kg, goal.carbs_per_kg, goal.protein_per_kg, goal.fat_per_kg)
         if any(getattr(goal, field) != value or getattr(goal, f"{field}_goal") != value for field, value in values.items()):
             for field, value in values.items():
                 setattr(goal, field, value)
                 setattr(goal, f"{field}_goal", value)
-            db.commit(); db.refresh(goal)
+            if persist:
+                db.flush()
     return goal
 
 
@@ -283,7 +301,7 @@ def read_goals(db: Session = Depends(get_db)): return get_daily_goal(db)
 
 @app.put("/api/settings/goals", response_model=DailyGoalResponse)
 def update_goals(payload: DailyGoalUpdate, db: Session = Depends(get_db)):
-    goal = get_daily_goal(db)
+    goal = get_daily_goal(db, persist=True)
     if payload.weight_kg is not None:
         values = goal_values(payload.weight_kg, payload.carbs_per_kg, payload.protein_per_kg, payload.fat_per_kg)
         goal.weight_kg = payload.weight_kg
@@ -312,8 +330,8 @@ def create_food(payload: FoodCreate, db: Session = Depends(get_db)):
 
 
 @app.get("/api/foods", response_model=list[FoodResponse])
-def list_foods(search: str | None = None, category: str | None = None, primary_category: str | None = None, limit: int = Query(30, ge=1, le=100), offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
-    statement = select(Food).order_by(Food.name)
+def list_foods(search: str | None = None, category: str | None = None, primary_category: str | None = None, sort: str | None = None, limit: int = Query(30, ge=1, le=100), offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
+    statement = select(Food)
     if search and search.strip():
         term = search.strip(); statement = statement.where(or_(Food.name.contains(term), Food.normalized_name.contains(normalize_food_name(term))))
     if category == "蛋白质": statement = statement.where(Food.protein_per_100g > 0)
@@ -322,8 +340,24 @@ def list_foods(search: str | None = None, category: str | None = None, primary_c
     elif category == "酒": statement = statement.where(Food.alcohol_abv > 0)
     elif category == "综合": statement = statement.where(Food.protein_per_100g == 0, Food.fat_per_100g == 0, Food.carbs_per_100g == 0)
     if primary_category:
-        foods = [food for food in db.scalars(statement).all() if food_primary_category(food) == primary_category]
-        return [food_to_response(food) for food in foods[offset:offset + limit]]
+        carb_kcal = Food.carbs_per_100g * 4
+        protein_kcal = Food.protein_per_100g * 4
+        fat_kcal = Food.fat_per_100g * 9
+        alcohol_kcal = case((Food.unit == "ml", Food.base_amount * Food.alcohol_abv / 100 * 0.789 * 7), else_=0)
+        scores = {"碳水": carb_kcal, "蛋白质": protein_kcal, "脂肪": fat_kcal, "酒": alcohol_kcal}
+        selected_score = scores.get(primary_category)
+        if selected_score is not None:
+            names = list(scores)
+            selected_index = names.index(primary_category)
+            comparisons = [selected_score > score if index < selected_index else selected_score >= score for index, (name, score) in enumerate(scores.items()) if name != primary_category]
+            statement = statement.where(selected_score > 0, *comparisons)
+    if sort == "usage":
+        cutoff = datetime.now() - timedelta(days=30)
+        recent_count = func.sum(case((FoodRecord.eaten_at >= cutoff, 1), else_=0))
+        last_used = func.max(FoodRecord.eaten_at)
+        statement = statement.outerjoin(FoodRecord, FoodRecord.food_id == Food.id).group_by(Food.id).order_by(recent_count.desc(), last_used.desc(), Food.name)
+    else:
+        statement = statement.order_by(Food.name)
     return [food_to_response(food) for food in db.scalars(statement.offset(offset).limit(limit)).all()]
 
 
@@ -356,12 +390,21 @@ def create_record(payload: FoodRecordCreate, db: Session = Depends(get_db)):
 
 @app.post("/api/records/batch", response_model=list[FoodRecordResponse], status_code=201)
 def create_records_batch(payload: FoodRecordBatchCreate, db: Session = Depends(get_db)):
+    if payload.request_id:
+        completed = db.get(RecordBatchRequest, payload.request_id)
+        if completed:
+            ids = json.loads(completed.record_ids)
+            records_by_id = {record.id: record for record in db.scalars(select(FoodRecord).where(FoodRecord.id.in_(ids))).all()}
+            return [records_by_id[item_id] for item_id in ids if item_id in records_by_id]
     records = []
     try:
         for item in payload.records:
             record = FoodRecord(**record_values(item, db))
             db.add(record)
             records.append(record)
+        db.flush()
+        if payload.request_id:
+            db.add(RecordBatchRequest(request_id=payload.request_id, record_ids=json.dumps([record.id for record in records])))
         db.commit()
         for record in records:
             db.refresh(record)
@@ -443,8 +486,8 @@ def ai_parse(payload: AIParseRequest, db: Session = Depends(get_db)):
             name = raw_name.strip(); food = find_food_by_name(db, name)
             quantity = ai_number(raw.get("quantity", raw.get("weight")), minimum=0.000001)
             unit = ai_unit(raw.get("unit") or "g")
-            meal_type = raw.get("meal_type") if raw.get("meal_type") in {"早餐", "午餐", "晚餐", "加餐"} else "加餐"
             eaten_at = ai_datetime(raw.get("eaten_at"))
+            meal_type = raw.get("meal_type") if raw.get("meal_type") in {"早餐", "午餐", "晚餐", "加餐"} else default_meal_type(eaten_at or datetime.now())
             if food:
                 unit = food.unit; ratio = quantity / food.base_amount if quantity is not None else 0
                 protein, fat, carbs = food.protein_per_100g * ratio, food.fat_per_100g * ratio, food.carbs_per_100g * ratio
