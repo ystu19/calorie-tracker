@@ -15,13 +15,29 @@ const preview = computed(() => {
   return { carbs, protein, fat, calories: round(carbs * 4.1 + protein * 4.1 + fat * 9.3) };
 });
 
-onMounted(async () => Object.assign(form, await (await fetch("/api/settings/goals")).json()));
+onMounted(async () => {
+  try {
+    const response = await fetch("/api/settings/goals");
+    if (!response.ok) throw new Error("目标加载失败");
+    Object.assign(form, await response.json());
+  } catch (error) {
+    message.value = error.message || "目标加载失败";
+  }
+});
 async function save() {
   saving.value = true; message.value = "";
-  const response = await authFetch("/api/settings/goals", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ weight_kg:Number(form.weight_kg), carbs_per_kg:Number(form.carbs_per_kg), protein_per_kg:Number(form.protein_per_kg), fat_per_kg:Number(form.fat_per_kg) }) });
-  if (response.ok) { const goals = await response.json(); Object.assign(form, goals); message.value = "目标已保存"; emit("saved", goals); }
-  else message.value = "保存失败，请检查输入";
-  saving.value = false;
+  try {
+    const response = await authFetch("/api/settings/goals", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ weight_kg:Number(form.weight_kg), carbs_per_kg:Number(form.carbs_per_kg), protein_per_kg:Number(form.protein_per_kg), fat_per_kg:Number(form.fat_per_kg) }) });
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.detail || "保存失败，请检查输入");
+    }
+    const goals = await response.json(); Object.assign(form, goals); message.value = "目标已保存"; emit("saved", goals);
+  } catch (error) {
+    message.value = error.message || "保存失败，请稍后重试";
+  } finally {
+    saving.value = false;
+  }
 }
 </script>
 

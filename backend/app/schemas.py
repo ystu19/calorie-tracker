@@ -57,6 +57,10 @@ class FoodRecordResponse(BaseModel):
     created_at: datetime
 
 
+class FoodRecordBatchCreate(BaseModel):
+    records: list[FoodRecordCreate] = Field(min_length=1, max_length=50)
+
+
 class FoodCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     base_amount: float = Field(default=100, gt=0)

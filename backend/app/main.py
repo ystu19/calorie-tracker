@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import math
 import os
 import re
 import secrets
@@ -19,7 +20,7 @@ from app.ai_service import parse_food_text
 from app.database import get_db, init_db
 from app.models import DailyGoal, Food, FoodRecord
 from app.schemas import (AIParseRequest, AIParsedItem, AIParseResponse, DailyGoalResponse,
-                         DailyGoalUpdate, DailyStats, FoodCreate, FoodRecordCreate,
+                         DailyGoalUpdate, DailyStats, FoodCreate, FoodRecordBatchCreate, FoodRecordCreate,
                          FoodRecordResponse, FoodResponse, TrendPoint, UnlockRequest)
 
 load_dotenv()
@@ -104,6 +105,17 @@ def food_categories(protein: float, fat: float, carbs: float, alcohol_abv: float
     if carbs > 0: categories.append("碳水")
     if alcohol_abv > 0: categories.append("酒")
     return categories or ["综合"]
+
+
+def food_primary_category(food: Food) -> str:
+    scores = [
+        ("碳水", food.carbs_per_100g * 4),
+        ("蛋白质", food.protein_per_100g * 4),
+        ("脂肪", food.fat_per_100g * 9),
+        ("酒", food.base_amount * food.alcohol_abv / 100 * 0.789 * 7 if food.unit == "ml" else 0),
+    ]
+    category, score = max(scores, key=lambda item: item[1])
+    return category if score > 0 else ""
 
 
 def day_bounds(value: date) -> tuple[datetime, datetime]:
@@ -300,7 +312,7 @@ def create_food(payload: FoodCreate, db: Session = Depends(get_db)):
 
 
 @app.get("/api/foods", response_model=list[FoodResponse])
-def list_foods(search: str | None = None, category: str | None = None, limit: int = Query(30, ge=1, le=100), offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
+def list_foods(search: str | None = None, category: str | None = None, primary_category: str | None = None, limit: int = Query(30, ge=1, le=100), offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
     statement = select(Food).order_by(Food.name)
     if search and search.strip():
         term = search.strip(); statement = statement.where(or_(Food.name.contains(term), Food.normalized_name.contains(normalize_food_name(term))))
@@ -309,6 +321,9 @@ def list_foods(search: str | None = None, category: str | None = None, limit: in
     elif category == "碳水": statement = statement.where(Food.carbs_per_100g > 0)
     elif category == "酒": statement = statement.where(Food.alcohol_abv > 0)
     elif category == "综合": statement = statement.where(Food.protein_per_100g == 0, Food.fat_per_100g == 0, Food.carbs_per_100g == 0)
+    if primary_category:
+        foods = [food for food in db.scalars(statement).all() if food_primary_category(food) == primary_category]
+        return [food_to_response(food) for food in foods[offset:offset + limit]]
     return [food_to_response(food) for food in db.scalars(statement.offset(offset).limit(limit)).all()]
 
 
@@ -326,12 +341,34 @@ def update_food(food_id: int, payload: FoodCreate, db: Session = Depends(get_db)
 
 @app.delete("/api/foods/{food_id}", status_code=204)
 def delete_food(food_id: int, db: Session = Depends(get_db)):
-    db.delete(get_or_404(Food, food_id, db, "食物不存在")); db.commit(); return Response(status_code=204)
+    food = get_or_404(Food, food_id, db, "食物不存在")
+    referenced_records = db.scalars(select(FoodRecord).where(FoodRecord.food_id == food_id)).all()
+    for record in referenced_records:
+        record.food_id = None
+        record.nutrition_source = "manual"
+    db.delete(food); db.commit(); return Response(status_code=204)
 
 
 @app.post("/api/records", response_model=FoodRecordResponse, status_code=201)
 def create_record(payload: FoodRecordCreate, db: Session = Depends(get_db)):
     record = FoodRecord(**record_values(payload, db)); db.add(record); db.commit(); db.refresh(record); return record
+
+
+@app.post("/api/records/batch", response_model=list[FoodRecordResponse], status_code=201)
+def create_records_batch(payload: FoodRecordBatchCreate, db: Session = Depends(get_db)):
+    records = []
+    try:
+        for item in payload.records:
+            record = FoodRecord(**record_values(item, db))
+            db.add(record)
+            records.append(record)
+        db.commit()
+        for record in records:
+            db.refresh(record)
+        return records
+    except Exception:
+        db.rollback()
+        raise
 
 
 @app.get("/api/records", response_model=list[FoodRecordResponse])
@@ -343,7 +380,7 @@ def list_records(date_filter: date | None = Query(None, alias="date"), db: Sessi
 @app.put("/api/records/{record_id}", response_model=FoodRecordResponse)
 def update_record(record_id: int, payload: FoodRecordCreate, db: Session = Depends(get_db)):
     record = get_or_404(FoodRecord, record_id, db, "饮食记录不存在")
-    effective = payload.model_copy(update={"food_id": record.food_id}) if record.food_id and payload.food_id is None else payload
+    effective = payload.model_copy(update={"food_id": record.food_id}) if record.food_id and "food_id" not in payload.model_fields_set else payload
     for field, value in record_values(effective, db).items(): setattr(record, field, value)
     db.commit(); db.refresh(record); return record
 
@@ -353,6 +390,43 @@ def delete_record(record_id: int, db: Session = Depends(get_db)):
     db.delete(get_or_404(FoodRecord, record_id, db, "饮食记录不存在")); db.commit(); return Response(status_code=204)
 
 
+def ai_number(value, default: float | None = None, minimum: float | None = None, maximum: float | None = None) -> float | None:
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        if isinstance(value, str):
+            match = re.search(r"[-+]?\d+(?:\.\d+)?", value.replace(",", ""))
+            if not match:
+                return default
+            value = match.group()
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return default
+    if not math.isfinite(number):
+        return default
+    if minimum is not None and number < minimum:
+        return default
+    if maximum is not None:
+        number = min(number, maximum)
+    return number
+
+
+def ai_datetime(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def ai_unit(value) -> str:
+    aliases = {"克": "g", "毫升": "ml", "个": "个", "份": "份", "g": "g", "ml": "ml"}
+    return aliases.get(str(value).strip().lower(), "g")
+
+
 @app.post("/api/ai/parse", response_model=AIParseResponse)
 def ai_parse(payload: AIParseRequest, db: Session = Depends(get_db)):
     try: extracted = parse_food_text(payload.text, datetime.now())
@@ -360,24 +434,36 @@ def ai_parse(payload: AIParseRequest, db: Session = Depends(get_db)):
     except Exception: raise HTTPException(502, "AI 解析服务暂时不可用") from None
     items = []
     for raw in extracted:
-        name = str(raw.get("food_name", "")).strip(); food = find_food_by_name(db, name)
-        quantity = raw.get("quantity", raw.get("weight")); unit = raw.get("unit") or "g"
-        if unit not in UNITS: unit = "g"
-        if food:
-            unit = food.unit; ratio = float(quantity) / food.base_amount if quantity is not None else 0
-            protein, fat, carbs = food.protein_per_100g * ratio, food.fat_per_100g * ratio, food.carbs_per_100g * ratio
-            alcohol_abv = food.alcohol_abv
-            source = "food_library"
-        else:
-            protein, fat, carbs = float(raw.get("protein") or 0), float(raw.get("fat") or 0), float(raw.get("carbs") or 0)
-            alcohol_abv = float(raw.get("alcohol_abv") or 0)
-            source = "ai_estimated"
-        items.append(AIParsedItem(
-            food_name=name, quantity=quantity, weight=quantity if unit == "g" else None, unit=unit,
-            meal_type=raw.get("meal_type", "加餐"), eaten_at=raw.get("eaten_at"), matched=food is not None,
-            food_id=food.id if food else None, calories=total_calories(protein, fat, carbs, float(quantity or 0), unit, alcohol_abv),
-            protein=round(protein, 2), fat=round(fat, 2), carbs=round(carbs, 2), alcohol_abv=alcohol_abv, nutrition_source=source,
-        ))
+        if not isinstance(raw, dict):
+            continue
+        try:
+            raw_name = raw.get("food_name")
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                continue
+            name = raw_name.strip(); food = find_food_by_name(db, name)
+            quantity = ai_number(raw.get("quantity", raw.get("weight")), minimum=0.000001)
+            unit = ai_unit(raw.get("unit") or "g")
+            meal_type = raw.get("meal_type") if raw.get("meal_type") in {"早餐", "午餐", "晚餐", "加餐"} else "加餐"
+            eaten_at = ai_datetime(raw.get("eaten_at"))
+            if food:
+                unit = food.unit; ratio = quantity / food.base_amount if quantity is not None else 0
+                protein, fat, carbs = food.protein_per_100g * ratio, food.fat_per_100g * ratio, food.carbs_per_100g * ratio
+                alcohol_abv = food.alcohol_abv
+                source = "food_library"
+            else:
+                protein = ai_number(raw.get("protein"), default=0, minimum=0) or 0
+                fat = ai_number(raw.get("fat"), default=0, minimum=0) or 0
+                carbs = ai_number(raw.get("carbs"), default=0, minimum=0) or 0
+                alcohol_abv = ai_number(raw.get("alcohol_abv"), default=0, minimum=0, maximum=100) or 0
+                source = "ai_estimated"
+            items.append(AIParsedItem(
+                food_name=name, quantity=quantity, weight=quantity if unit == "g" else None, unit=unit,
+                meal_type=meal_type, eaten_at=eaten_at, matched=food is not None,
+                food_id=food.id if food else None, calories=total_calories(protein, fat, carbs, quantity or 0, unit, alcohol_abv),
+                protein=round(protein, 2), fat=round(fat, 2), carbs=round(carbs, 2), alcohol_abv=alcohol_abv, nutrition_source=source,
+            ))
+        except (TypeError, ValueError, ArithmeticError):
+            continue
     return AIParseResponse(items=items)
 
 

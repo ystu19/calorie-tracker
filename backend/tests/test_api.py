@@ -87,6 +87,34 @@ def test_edit_library_quantity_recalculates(client):
     assert changed["protein"] == 15 and changed["calories"] == 73.5
 
 
+def test_explicit_null_food_id_unlinks_library_record(client):
+    food = client.post("/api/foods", json=food_payload("解除关联食物")).json()
+    created = client.post("/api/records", json=record_payload(name=food["name"], food_id=food["id"])).json()
+    changed = client.put(
+        f"/api/records/{created['id']}",
+        json=record_payload(name="自定义替代", food_id=None, protein=5, fat=1, carbs=2),
+    )
+    assert changed.status_code == 200
+    assert changed.json()["food_id"] is None
+    assert changed.json()["food_name"] == "自定义替代"
+    assert changed.json()["nutrition_source"] == "manual"
+
+
+def test_deleting_referenced_food_preserves_editable_record_snapshot(client):
+    food = client.post("/api/foods", json=food_payload("待删除引用食物")).json()
+    created = client.post("/api/records", json=record_payload(name=food["name"], food_id=food["id"])).json()
+    assert client.delete(f"/api/foods/{food['id']}").status_code == 204
+    preserved = client.get("/api/records", params={"date": created["eaten_at"][:10]}).json()[0]
+    assert preserved["food_id"] is None
+    assert preserved["nutrition_source"] == "manual"
+    changed = client.put(
+        f"/api/records/{created['id']}",
+        json=record_payload(name=preserved["food_name"], quantity=50, food_id=None, protein=preserved["protein"], fat=preserved["fat"], carbs=preserved["carbs"]),
+    )
+    assert changed.status_code == 200
+    assert changed.json()["quantity"] == 50
+
+
 def test_alcohol_ml_abv_calculation_and_edit(client):
     beer = client.post("/api/foods", json=food_payload("测试啤酒", unit="ml", base=500, protein=0, fat=0, carbs=0, alcohol_abv=5)).json()
     assert beer["alcohol_abv"] == 5 and beer["calories"] == 138.08
