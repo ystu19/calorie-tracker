@@ -1,10 +1,13 @@
 <script setup>
-import { computed, onMounted, reactive, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
 import { authFetch } from "../utils/auth.js";
+import { cacheKeys, readCache, writeCache } from "../utils/cache.js";
 
 const emit = defineEmits(["saved"]);
 const form = reactive({ weight_kg: "", carbs_per_kg: 2.5, protein_per_kg: 1.2, fat_per_kg: 0.8, calories: 2000, protein: 120, fat: 65, carbs: 250 });
 const saving = ref(false), message = ref("");
+let active = true;
+const settled = promise => promise.then(data => ({ data }), error => ({ error }));
 const round = value => Math.round((Number(value) + Number.EPSILON) * 100) / 100;
 const preview = computed(() => {
   const weight = Number(form.weight_kg);
@@ -16,14 +19,20 @@ const preview = computed(() => {
 });
 
 onMounted(async () => {
-  try {
-    const response = await fetch("/api/settings/goals");
-    if (!response.ok) throw new Error("目标加载失败");
-    Object.assign(form, await response.json());
-  } catch (error) {
-    message.value = error.message || "目标加载失败";
-  }
+  let networkResolved = false;
+  const networkTask = settled(fetch("/api/settings/goals")).then(async result => {
+    if (!active) return;
+    if (result.error) { message.value = result.error.message || "目标加载失败"; return; }
+    if (!result.data.ok) { message.value = "目标加载失败"; return; }
+    const goals = await result.data.json();
+    if (!active) return;
+    networkResolved = true; Object.assign(form, goals); void writeCache(cacheKeys.goals, goals);
+  });
+  const cached = await readCache(cacheKeys.goals);
+  if (cached && !networkResolved && active) Object.assign(form, cached);
+  await networkTask;
 });
+onBeforeUnmount(() => { active = false; });
 async function save() {
   saving.value = true; message.value = "";
   try {
@@ -32,7 +41,7 @@ async function save() {
       const body = await response.json().catch(() => ({}));
       throw new Error(body.detail || "保存失败，请检查输入");
     }
-    const goals = await response.json(); Object.assign(form, goals); message.value = "目标已保存"; emit("saved", goals);
+    const goals = await response.json(); Object.assign(form, goals); void writeCache(cacheKeys.goals, goals); message.value = "目标已保存"; emit("saved", goals);
   } catch (error) {
     message.value = error.message || "保存失败，请稍后重试";
   } finally {
