@@ -100,20 +100,18 @@ def goal_values(weight_kg: float, carbs_per_kg: float, protein_per_kg: float, fa
 
 
 def food_categories(protein: float, fat: float, carbs: float, alcohol_abv: float = 0) -> list[str]:
-    categories = []
-    if protein > 0: categories.append("蛋白质")
-    if fat > 0: categories.append("脂肪")
-    if carbs > 0: categories.append("碳水")
+    scores = [("碳水", carbs), ("蛋白质", protein), ("脂肪", fat)]
+    category, score = max(scores, key=lambda item: item[1])
+    categories = [category] if score > 0 else []
     if alcohol_abv > 0: categories.append("酒")
     return categories or ["综合"]
 
 
 def food_primary_category(food: Food) -> str:
     scores = [
-        ("碳水", food.carbs_per_100g * 4),
-        ("蛋白质", food.protein_per_100g * 4),
-        ("脂肪", food.fat_per_100g * 9),
-        ("酒", food.base_amount * food.alcohol_abv / 100 * 0.789 * 7 if food.unit == "ml" else 0),
+        ("碳水", food.carbs_per_100g),
+        ("蛋白质", food.protein_per_100g),
+        ("脂肪", food.fat_per_100g),
     ]
     category, score = max(scores, key=lambda item: item[1])
     return category if score > 0 else ""
@@ -330,27 +328,19 @@ def create_food(payload: FoodCreate, db: Session = Depends(get_db)):
 
 
 @app.get("/api/foods", response_model=list[FoodResponse])
-def list_foods(search: str | None = None, category: str | None = None, primary_category: str | None = None, sort: str | None = None, limit: int = Query(30, ge=1, le=100), offset: int = Query(0, ge=0), db: Session = Depends(get_db)):
+def list_foods(search: str | None = None, category: str | None = None, primary_category: str | None = None, sort: str | None = None, limit: int = Query(30, ge=1, le=100), offset: int = Query(0, ge=0), all_items: bool = Query(False, alias="all"), db: Session = Depends(get_db)):
     statement = select(Food)
     if search and search.strip():
         term = search.strip(); statement = statement.where(or_(Food.name.contains(term), Food.normalized_name.contains(normalize_food_name(term))))
-    if category == "蛋白质": statement = statement.where(Food.protein_per_100g > 0)
-    elif category == "脂肪": statement = statement.where(Food.fat_per_100g > 0)
-    elif category == "碳水": statement = statement.where(Food.carbs_per_100g > 0)
-    elif category == "酒": statement = statement.where(Food.alcohol_abv > 0)
-    elif category == "综合": statement = statement.where(Food.protein_per_100g == 0, Food.fat_per_100g == 0, Food.carbs_per_100g == 0)
-    if primary_category:
-        carb_kcal = Food.carbs_per_100g * 4
-        protein_kcal = Food.protein_per_100g * 4
-        fat_kcal = Food.fat_per_100g * 9
-        alcohol_kcal = case((Food.unit == "ml", Food.base_amount * Food.alcohol_abv / 100 * 0.789 * 7), else_=0)
-        scores = {"碳水": carb_kcal, "蛋白质": protein_kcal, "脂肪": fat_kcal, "酒": alcohol_kcal}
-        selected_score = scores.get(primary_category)
-        if selected_score is not None:
-            names = list(scores)
-            selected_index = names.index(primary_category)
-            comparisons = [selected_score > score if index < selected_index else selected_score >= score for index, (name, score) in enumerate(scores.items()) if name != primary_category]
-            statement = statement.where(selected_score > 0, *comparisons)
+    selected_category = primary_category or category
+    if selected_category == "碳水":
+        statement = statement.where(Food.carbs_per_100g > 0, Food.carbs_per_100g >= Food.protein_per_100g, Food.carbs_per_100g >= Food.fat_per_100g)
+    elif selected_category == "蛋白质":
+        statement = statement.where(Food.protein_per_100g > 0, Food.protein_per_100g > Food.carbs_per_100g, Food.protein_per_100g >= Food.fat_per_100g)
+    elif selected_category == "脂肪":
+        statement = statement.where(Food.fat_per_100g > 0, Food.fat_per_100g > Food.carbs_per_100g, Food.fat_per_100g > Food.protein_per_100g)
+    elif selected_category == "酒": statement = statement.where(Food.alcohol_abv > 0)
+    elif selected_category == "综合": statement = statement.where(Food.protein_per_100g == 0, Food.fat_per_100g == 0, Food.carbs_per_100g == 0, Food.alcohol_abv <= 0)
     if sort == "usage":
         cutoff = datetime.now() - timedelta(days=30)
         recent_count = func.sum(case((FoodRecord.eaten_at >= cutoff, 1), else_=0))
@@ -358,7 +348,8 @@ def list_foods(search: str | None = None, category: str | None = None, primary_c
         statement = statement.outerjoin(FoodRecord, FoodRecord.food_id == Food.id).group_by(Food.id).order_by(recent_count.desc(), last_used.desc(), Food.name)
     else:
         statement = statement.order_by(Food.name)
-    return [food_to_response(food) for food in db.scalars(statement.offset(offset).limit(limit)).all()]
+    if not all_items: statement = statement.offset(offset).limit(limit)
+    return [food_to_response(food) for food in db.scalars(statement).all()]
 
 
 @app.get("/api/foods/{food_id}", response_model=FoodResponse)

@@ -130,7 +130,7 @@ def test_food_calories_are_server_calculated_and_categories(client):
     mixed = client.post("/api/foods", json=food_payload("均衡", protein=10, fat=0, carbs=10)).json()
     assert protein["calories"] == 40 and protein["categories"] == ["蛋白质"]
     assert fat["calories"] == 90 and fat["categories"] == ["脂肪"]
-    assert set(mixed["categories"]) == {"蛋白质", "碳水"}
+    assert mixed["categories"] == ["碳水"]
 
 
 def test_auto_add_and_normalized_duplicate_prevention(client):
@@ -173,8 +173,20 @@ def test_search_category_and_limit(client):
     protein_ids = {food["id"] for food in client.get("/api/foods", params={"category": "蛋白质"}).json()}
     fat_ids = {food["id"] for food in client.get("/api/foods", params={"category": "脂肪"}).json()}
     carbs_ids = {food["id"] for food in client.get("/api/foods", params={"category": "碳水"}).json()}
-    assert set(egg["categories"]) == {"蛋白质", "脂肪", "碳水"}
-    assert egg["id"] in protein_ids & fat_ids & carbs_ids
+    assert egg["categories"] == ["蛋白质"]
+    assert egg["id"] in protein_ids and egg["id"] not in fat_ids | carbs_ids
+
+
+def test_primary_category_ties_alcohol_and_full_list(client):
+    tied = client.post("/api/foods", json=food_payload("并列营养", protein=8, fat=8, carbs=8)).json()
+    wine = client.post("/api/foods", json=food_payload("含糖酒", unit="ml", base=100, protein=0, fat=0, carbs=4, alcohol_abv=12)).json()
+    carb_ids = {food["id"] for food in client.get("/api/foods", params={"primary_category": "碳水"}).json()}
+    alcohol_ids = {food["id"] for food in client.get("/api/foods", params={"primary_category": "酒"}).json()}
+    assert tied["categories"] == ["碳水"] and tied["id"] in carb_ids
+    assert wine["categories"] == ["碳水", "酒"] and wine["id"] in carb_ids & alcohol_ids
+    for index in range(101): client.post("/api/foods", json=food_payload(f"全量食物{index}"))
+    all_foods = client.get("/api/foods", params={"all": True}).json()
+    assert len(all_foods) >= 103
 
 
 def test_old_database_migration_and_legacy_api(client):

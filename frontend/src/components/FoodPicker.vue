@@ -1,68 +1,89 @@
 <script setup>
-import { onBeforeUnmount, onMounted, ref, watch } from "vue";
-import { FOOD_CATEGORY_FILTERS, foodPrimaryCategory } from "../utils/foodCategories.js";
+import { computed, onBeforeUnmount, onMounted, ref, watch } from "vue";
+import { FOOD_CATEGORY_FILTERS, foodMatchesCategory, foodPrimaryCategory } from "../utils/foodCategories.js";
 import { onFoodUsageChanged } from "../utils/foodUsage.js";
-import { cacheKeys, readCache, writeCache } from "../utils/cache.js";
+import { cacheKeys, readCache, writeFoodsCache } from "../utils/cache.js";
 
 const props = defineProps({ selectedId: { type: [Number, String], default: "" }, placeholder: { type: String, default: "搜索食物名称" } });
 const emit = defineEmits(["select", "clear"]);
 const query = ref("");
 const category = ref("");
-const results = ref([]);
+const allFoods = ref([]);
 const open = ref(false);
 const loading = ref(false);
 const error = ref("");
 const root = ref(null);
-let timer, searchController, removeUsageListener;
-let suppressQuerySearch = false;
-let searchRequestId = 0;
+let removeUsageListener;
+let loadRequestId = 0;
 const settled = promise => promise.then(data => ({ data }), error => ({ error }));
+const results = computed(() => {
+  const term = query.value.trim().toLocaleLowerCase();
+  return allFoods.value.filter(food =>
+    foodMatchesCategory(food, category.value) &&
+    (!term || food.name.toLocaleLowerCase().includes(term))
+  );
+});
 
-async function searchFoods(showResults = true) {
-  const requestId = ++searchRequestId;
-  searchController?.abort();
-  searchController = new AbortController();
+async function loadFoods(showResults = false, useCache = true) {
+  const requestId = ++loadRequestId;
   loading.value = true;
   error.value = "";
-  const params = new URLSearchParams({ limit: "20", offset: "0", sort: "usage" });
-  if (query.value.trim()) params.set("search", query.value.trim());
-  if (category.value) params.set("primary_category", category.value);
-  const key = cacheKeys.foods(params);
   let networkResolved = false;
-  const networkTask = settled(fetch(`/api/foods?${params}`, { signal: searchController.signal }).then(async response => {
-    if (!response.ok) throw new Error("食物搜索失败");
+  const networkTask = settled(fetch("/api/foods?all=true&sort=usage").then(async response => {
+    if (!response.ok) throw new Error("食物列表加载失败");
     return response.json();
   })).then(result => {
     if (result.error) {
-      if (result.error.name !== "AbortError" && requestId === searchRequestId) {
-        error.value = result.error.message || "食物搜索失败";
+      if (requestId === loadRequestId) {
+        error.value = result.error.message || "食物列表加载失败";
         if (showResults) open.value = true;
       }
       return;
     }
-    if (requestId !== searchRequestId) return;
+    if (requestId !== loadRequestId) return;
     networkResolved = true;
-    results.value = result.data;
-    void writeCache(key, result.data);
+    allFoods.value = result.data;
+    void writeFoodsCache(result.data);
     if (showResults) open.value = true;
     loading.value = false;
   });
-  const cached = await readCache(key);
-  if (cached && !networkResolved && requestId === searchRequestId) { results.value = cached; if (showResults) open.value = true; }
+  const cached = useCache ? await readCache(cacheKeys.foodsAll) : null;
+  if (cached && !networkResolved && requestId === loadRequestId) {
+    allFoods.value = cached;
+    if (showResults) open.value = true;
+    loading.value = false;
+  }
   await networkTask;
-  if (requestId === searchRequestId) loading.value = false;
+  if (requestId === loadRequestId) loading.value = false;
 }
 
-function choose(food) { suppressQuerySearch = true; clearTimeout(timer); query.value = food.name; open.value = false; emit("select", food); }
-function clear() { suppressQuerySearch = true; query.value = ""; emit("clear"); searchFoods(); }
+function choose(food) {
+  query.value = food.name;
+  open.value = false;
+  emit("select", food);
+}
+function clear() {
+  query.value = "";
+  emit("clear");
+}
 function closeOnOutside(event) { if (root.value && !root.value.contains(event.target)) open.value = false; }
 function closeOnEscape() { open.value = false; }
 function foodCategoryShortLabel(food) { return { "碳水": "碳", "蛋白质": "蛋", "脂肪": "脂" }[foodPrimaryCategory(food)] || foodPrimaryCategory(food); }
 
-watch(query, () => { if (suppressQuerySearch) { suppressQuerySearch = false; return; } clearTimeout(timer); timer = setTimeout(searchFoods, 180); });
-watch(category, () => { clearTimeout(timer); timer = setTimeout(searchFoods, 80); });
-watch(() => props.selectedId, value => { if (!value) { clearTimeout(timer); if (query.value) { suppressQuerySearch = true; query.value = ""; } open.value = false; } });
-onMounted(() => { searchFoods(false); removeUsageListener = onFoodUsageChanged(() => searchFoods(false)); document.addEventListener("pointerdown", closeOnOutside); });
-onBeforeUnmount(() => { clearTimeout(timer); searchController?.abort(); removeUsageListener?.(); document.removeEventListener("pointerdown", closeOnOutside); });
+watch(() => props.selectedId, value => {
+  if (!value) {
+    if (query.value) query.value = "";
+    open.value = false;
+  }
+});
+onMounted(() => {
+  loadFoods();
+  removeUsageListener = onFoodUsageChanged(() => loadFoods(false, false));
+  document.addEventListener("pointerdown", closeOnOutside);
+});
+onBeforeUnmount(() => {
+  removeUsageListener?.();
+  document.removeEventListener("pointerdown", closeOnOutside);
+});
 </script>
-<template><div ref="root" class="food-picker" @keydown.esc="closeOnEscape"><div class="picker-row"><input v-model="query" :placeholder="placeholder" @pointerdown="open=true;searchFoods()"/><button v-if="selectedId" type="button" class="text-button" @click="clear">清除</button></div><div v-if="open" class="picker-results"><div class="category-filter"><button v-for="item in FOOD_CATEGORY_FILTERS" :key="item||'all'" type="button" :class="{active:category===item}" @click.stop="category=item">{{item||'全部'}}</button></div><p v-if="loading">搜索中…</p><p v-else-if="error" class="error">{{error}}</p><p v-else-if="!results.length">没有匹配食物</p><button v-for="food in results" :key="food.id" type="button" @pointerdown.prevent="choose(food)"><strong>{{food.name}}</strong><span>{{food.base_amount}}{{food.unit}} · {{food.calories}} kcal</span><small>{{foodCategoryShortLabel(food)}} · C {{food.carbs}} / P {{food.protein}} / F {{food.fat}} <template v-if="food.alcohol_abv>0">· {{food.alcohol_abv}}% vol </template><i v-if="food.estimated">估算</i></small></button></div></div></template>
+<template><div ref="root" class="food-picker" @keydown.esc="closeOnEscape"><div class="picker-row"><input v-model="query" :placeholder="placeholder" @pointerdown="open=true"/><button v-if="selectedId" type="button" class="text-button" @click="clear">清除</button></div><div v-if="open" class="picker-results"><div class="category-filter"><button v-for="item in FOOD_CATEGORY_FILTERS" :key="item||'all'" type="button" :class="{active:category===item}" @click.stop="category=item">{{item||'全部'}}</button></div><p v-if="loading">加载中…</p><p v-else-if="error" class="error">{{error}}</p><p v-else-if="!results.length">没有匹配食物</p><button v-for="food in results" :key="food.id" type="button" @pointerdown.prevent="choose(food)"><strong>{{food.name}}</strong><span>{{food.base_amount}}{{food.unit}} · {{food.calories}} kcal</span><small>{{foodCategoryShortLabel(food)}} · C {{food.carbs}} / P {{food.protein}} / F {{food.fat}} <template v-if="food.alcohol_abv>0">· {{food.alcohol_abv}}% vol </template><i v-if="food.estimated">估算</i></small></button></div></div></template>

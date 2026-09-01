@@ -48,6 +48,15 @@ export async function writeCache(key, value) {
   } catch { /* Cache failures must never block normal page behavior. */ }
 }
 
+export async function writeFoodsCache(value) {
+  try {
+    await runTransaction("readwrite", store => {
+      store.delete(IDBKeyRange.bound("foods:", "foods:\uffff"));
+      return store.put({ key: "foods:all", value, updatedAt: Date.now() });
+    });
+  } catch { /* Cache failures must never block normal page behavior. */ }
+}
+
 export async function deleteCachePrefix(prefix) {
   try {
     await runTransaction("readwrite", store => {
@@ -63,17 +72,10 @@ export async function deleteCachePrefix(prefix) {
   } catch { /* Invalidation failures must not block server-backed writes. */ }
 }
 
-function normalizedParams(params) {
-  return [...new URLSearchParams(params).entries()]
-    .sort(([leftKey, leftValue], [rightKey, rightValue]) => leftKey.localeCompare(rightKey) || leftValue.localeCompare(rightValue))
-    .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
-    .join("&");
-}
-
 export const cacheKeys = {
   goals: "goals",
   records: date => `records:${date}`,
   stats: date => `stats:${date}`,
   trend: (endDate, days) => `trend:${endDate}:${days}`,
-  foods: params => `foods:${normalizedParams(params)}`,
+  foodsAll: "foods:all",
 };
