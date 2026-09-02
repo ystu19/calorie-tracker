@@ -87,6 +87,49 @@ def test_edit_library_quantity_recalculates(client):
     assert changed["protein"] == 15 and changed["calories"] == 73.5
 
 
+def test_serving_unit_conversion_and_history_snapshot(client):
+    food = client.post("/api/foods", json=food_payload(
+        "常用单位食物", protein=10, fat=5, carbs=20,
+        serving_unit="个", serving_weight_g=30,
+    )).json()
+    assert food["serving_unit"] == "个" and food["serving_weight_g"] == 30
+
+    two = client.post("/api/records", json=record_payload(
+        name=food["name"], food_id=food["id"], quantity=2, unit="个",
+    )).json()
+    grams = client.post("/api/records", json=record_payload(
+        name=food["name"], food_id=food["id"], quantity=45, unit="g",
+    )).json()
+    half = client.post("/api/records", json=record_payload(
+        name=food["name"], food_id=food["id"], quantity=.5, unit="个",
+    )).json()
+    assert (two["quantity"], two["unit"], two["weight"]) == (2, "个", 60)
+    assert (two["carbs"], two["protein"], two["fat"], two["calories"]) == (12, 6, 3, 99)
+    assert (grams["weight"], grams["carbs"]) == (45, 9)
+    assert (half["weight"], half["carbs"]) == (15, 3)
+
+    edited = client.put(f"/api/records/{two['id']}", json=record_payload(
+        name=food["name"], food_id=food["id"], quantity=2, unit="个",
+    )).json()
+    assert (edited["quantity"], edited["unit"]) == (2, "个")
+
+    changed_food = client.put(f"/api/foods/{food['id']}", json=food_payload(
+        food["name"], protein=10, fat=5, carbs=20,
+        serving_unit="个", serving_weight_g=35,
+    ))
+    assert changed_food.status_code == 200
+    preserved = {item["id"]: item for item in client.get("/api/records").json()}[two["id"]]
+    assert (preserved["quantity"], preserved["unit"], preserved["weight"], preserved["calories"]) == (2, "个", 60, 99)
+
+
+def test_serving_unit_validation(client):
+    missing_weight = client.post("/api/foods", json=food_payload("缺重量", serving_unit="片"))
+    zero_weight = client.post("/api/foods", json=food_payload("零重量", serving_unit="片", serving_weight_g=0))
+    orphan_weight = client.post("/api/foods", json=food_payload("缺单位", serving_weight_g=12))
+    wrong_base = client.post("/api/foods", json=food_payload("错误基准", base=50, serving_unit="片", serving_weight_g=12))
+    assert missing_weight.status_code == zero_weight.status_code == orphan_weight.status_code == wrong_base.status_code == 422
+
+
 def test_explicit_null_food_id_unlinks_library_record(client):
     food = client.post("/api/foods", json=food_payload("解除关联食物")).json()
     created = client.post("/api/records", json=record_payload(name=food["name"], food_id=food["id"])).json()
@@ -203,10 +246,10 @@ def test_old_database_migration_and_legacy_api(client):
         migrate_database(engine)
         record_cols = {c["name"] for c in inspect(engine).get_columns("food_records")}; food_cols = {c["name"] for c in inspect(engine).get_columns("foods")}
         assert {"quantity", "unit", "food_id", "nutrition_source", "alcohol_abv"} <= record_cols
-        assert {"base_amount", "unit", "category", "estimated", "normalized_name", "alcohol_abv"} <= food_cols
+        assert {"base_amount", "unit", "category", "estimated", "normalized_name", "alcohol_abv", "serving_unit", "serving_weight_g"} <= food_cols
         with engine.connect() as connection:
             assert connection.execute(text("SELECT quantity, unit FROM food_records WHERE id=1")).one() == (75, "g")
-            assert connection.execute(text("SELECT base_amount, unit, normalized_name FROM foods WHERE id=1")).one() == (100, "g", "旧食物")
+            assert connection.execute(text("SELECT base_amount, unit, normalized_name, serving_unit, serving_weight_g FROM foods WHERE id=1")).one() == (100, "g", "旧食物", None, None)
         engine.dispose()
 
 

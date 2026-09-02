@@ -154,6 +154,7 @@ def food_to_response(food: Food) -> dict:
     return {
         "id": food.id, "name": food.name, "normalized_name": food.normalized_name,
         "base_amount": food.base_amount, "unit": food.unit,
+        "serving_unit": food.serving_unit, "serving_weight_g": food.serving_weight_g,
         "calories": food.calories_per_100g, "protein": food.protein_per_100g,
         "fat": food.fat_per_100g, "carbs": food.carbs_per_100g, "alcohol_abv": food.alcohol_abv,
         "categories": food_categories(food.protein_per_100g, food.fat_per_100g, food.carbs_per_100g, food.alcohol_abv),
@@ -169,6 +170,8 @@ def apply_food_payload(food: Food, payload: FoodCreate) -> None:
     food.normalized_name = normalize_food_name(payload.name)
     food.base_amount = payload.base_amount
     food.unit = payload.unit
+    food.serving_unit = payload.serving_unit
+    food.serving_weight_g = payload.serving_weight_g
     food.protein_per_100g = protein
     food.fat_per_100g = fat
     food.carbs_per_100g = carbs
@@ -183,6 +186,18 @@ def find_food_by_name(db: Session, name: str) -> Food | None:
     return db.scalar(select(Food).where(Food.normalized_name == normalized))
 
 
+def food_quantity_ratio(food: Food, quantity: float, unit: str) -> tuple[float, float]:
+    if food.serving_unit and unit == food.serving_unit:
+        actual_weight_g = quantity * float(food.serving_weight_g or 0)
+        return actual_weight_g / 100, actual_weight_g
+    if unit == food.unit:
+        ratio = quantity / food.base_amount
+        return ratio, quantity
+    supported = [food.unit]
+    if food.serving_unit: supported.append(food.serving_unit)
+    raise HTTPException(status_code=422, detail=f"该食物仅支持单位 {' / '.join(supported)}")
+
+
 def record_values(payload: FoodRecordCreate, db: Session) -> dict:
     quantity = float(payload.quantity if payload.quantity is not None else payload.weight or 0)
     if quantity <= 0:
@@ -191,9 +206,7 @@ def record_values(payload: FoodRecordCreate, db: Session) -> dict:
     if payload.food_id and food is None:
         raise HTTPException(status_code=404, detail="食物不存在")
     if food:
-        if payload.unit != food.unit:
-            raise HTTPException(status_code=422, detail=f"该食物仅支持单位 {food.unit}")
-        ratio = quantity / food.base_amount
+        ratio, actual_weight = food_quantity_ratio(food, quantity, payload.unit)
         protein = food.protein_per_100g * ratio
         fat = food.fat_per_100g * ratio
         carbs = food.carbs_per_100g * ratio
@@ -205,9 +218,10 @@ def record_values(payload: FoodRecordCreate, db: Session) -> dict:
         alcohol_abv = float(payload.alcohol_abv or 0)
         source = payload.nutrition_source if payload.nutrition_source != "food_library" else "manual"
         name = payload.food_name
+        actual_weight = quantity
     values = {
         "food_name": name, "quantity": quantity, "unit": payload.unit,
-        "weight": quantity if payload.unit == "g" else quantity,
+        "weight": actual_weight,
         "food_id": food.id if food else None, "protein": round(protein, 2),
         "fat": round(fat, 2), "carbs": round(carbs, 2), "alcohol_abv": alcohol_abv,
         "calories": total_calories(protein, fat, carbs, quantity, payload.unit, alcohol_abv), "nutrition_source": source,
@@ -216,11 +230,10 @@ def record_values(payload: FoodRecordCreate, db: Session) -> dict:
     if not food and payload.add_to_library and (protein > 0 or fat > 0 or carbs > 0 or alcohol_abv > 0):
         existing = find_food_by_name(db, name)
         if existing:
-            if payload.unit != existing.unit:
-                raise HTTPException(status_code=422, detail=f"同名食物已存在，单位为 {existing.unit}")
-            ratio = quantity / existing.base_amount
+            ratio, actual_weight = food_quantity_ratio(existing, quantity, payload.unit)
             values.update({
                 "food_name": existing.name,
+                "weight": actual_weight,
                 "protein": round(existing.protein_per_100g * ratio, 2),
                 "fat": round(existing.fat_per_100g * ratio, 2),
                 "carbs": round(existing.carbs_per_100g * ratio, 2),
@@ -458,7 +471,8 @@ def ai_datetime(value) -> datetime | None:
 
 def ai_unit(value) -> str:
     aliases = {"克": "g", "毫升": "ml", "个": "个", "份": "份", "g": "g", "ml": "ml"}
-    return aliases.get(str(value).strip().lower(), "g")
+    normalized = str(value).strip()
+    return aliases.get(normalized.lower(), normalized[:20] or "g")
 
 
 @app.post("/api/ai/parse", response_model=AIParseResponse)
@@ -480,18 +494,20 @@ def ai_parse(payload: AIParseRequest, db: Session = Depends(get_db)):
             eaten_at = ai_datetime(raw.get("eaten_at"))
             meal_type = raw.get("meal_type") if raw.get("meal_type") in {"早餐", "午餐", "晚餐", "加餐"} else default_meal_type(eaten_at or datetime.now())
             if food:
-                unit = food.unit; ratio = quantity / food.base_amount if quantity is not None else 0
+                if unit != food.serving_unit: unit = food.unit
+                ratio, actual_weight = food_quantity_ratio(food, quantity, unit) if quantity is not None else (0, 0)
                 protein, fat, carbs = food.protein_per_100g * ratio, food.fat_per_100g * ratio, food.carbs_per_100g * ratio
                 alcohol_abv = food.alcohol_abv
                 source = "food_library"
             else:
+                actual_weight = quantity if unit == "g" else None
                 protein = ai_number(raw.get("protein"), default=0, minimum=0) or 0
                 fat = ai_number(raw.get("fat"), default=0, minimum=0) or 0
                 carbs = ai_number(raw.get("carbs"), default=0, minimum=0) or 0
                 alcohol_abv = ai_number(raw.get("alcohol_abv"), default=0, minimum=0, maximum=100) or 0
                 source = "ai_estimated"
             items.append(AIParsedItem(
-                food_name=name, quantity=quantity, weight=quantity if unit == "g" else None, unit=unit,
+                food_name=name, quantity=quantity, weight=actual_weight, unit=unit,
                 meal_type=meal_type, eaten_at=eaten_at, matched=food is not None,
                 food_id=food.id if food else None, calories=total_calories(protein, fat, carbs, quantity or 0, unit, alcohol_abv),
                 protein=round(protein, 2), fat=round(fat, 2), carbs=round(carbs, 2), alcohol_abv=alcohol_abv, nutrition_source=source,

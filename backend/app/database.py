@@ -52,6 +52,8 @@ def migrate_database(target_engine: Engine = engine) -> None:
         "estimated": "BOOLEAN NOT NULL DEFAULT 0",
         "normalized_name": "VARCHAR(100) NOT NULL DEFAULT ''",
         "alcohol_abv": "REAL NOT NULL DEFAULT 0",
+        "serving_unit": "VARCHAR(20)",
+        "serving_weight_g": "REAL",
     }
     has_goals = inspector.has_table("daily_goals")
     goal_columns = {column["name"] for column in inspector.get_columns("daily_goals")} if has_goals else set()

@@ -38,6 +38,8 @@ class Food(Base):
     alcohol_abv: Mapped[float] = mapped_column(Float, nullable=False, default=0)
     base_amount: Mapped[float] = mapped_column(Float, nullable=False, default=100)
     unit: Mapped[str] = mapped_column(String(10), nullable=False, default="g")
+    serving_unit: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    serving_weight_g: Mapped[float | None] = mapped_column(Float, nullable=True)
     # Legacy column retained for SQLite compatibility; application logic does not use it.
     category: Mapped[str] = mapped_column(String(20), nullable=False, server_default="综合")
     nutrition_source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")

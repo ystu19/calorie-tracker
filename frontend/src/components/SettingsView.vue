@@ -62,10 +62,10 @@ async function save() {
         <label>脂肪系数（g/kg）<input v-model.number="form.fat_per_kg" type="number" min="0.1" step="1" required /></label>
       </div>
       <div class="goal-preview">
-        <article><span>卡路里目标</span><strong>{{ preview.calories }}</strong><small>kcal</small></article>
-        <article><span>碳水目标</span><strong>{{ preview.carbs }}</strong><small>g</small></article>
-        <article><span>蛋白质目标</span><strong>{{ preview.protein }}</strong><small>g</small></article>
-        <article><span>脂肪目标</span><strong>{{ preview.fat }}</strong><small>g</small></article>
+        <article><span>卡路里目标</span><strong>{{ Math.round(preview.calories) }}</strong><small>kcal</small></article>
+        <article><span>碳水目标</span><strong>{{ Math.round(preview.carbs) }}</strong><small>g</small></article>
+        <article><span>蛋白质目标</span><strong>{{ Math.round(preview.protein) }}</strong><small>g</small></article>
+        <article><span>脂肪目标</span><strong>{{ Math.round(preview.fat) }}</strong><small>g</small></article>
       </div>
       <button class="primary" :disabled="saving">{{ saving ? "保存中…" : "保存目标" }}</button>
     </form><p v-if="message" class="success">{{ message }}</p>

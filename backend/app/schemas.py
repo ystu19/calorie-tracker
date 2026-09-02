@@ -1,7 +1,7 @@
 from datetime import date, datetime
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MealType = Literal["早餐", "午餐", "晚餐", "加餐"]
 FoodUnit = Literal["g", "ml", "个", "份"]
@@ -16,7 +16,7 @@ class UnlockRequest(BaseModel):
 class FoodRecordCreate(BaseModel):
     food_name: str = Field(min_length=1, max_length=100)
     quantity: float | None = Field(default=None, gt=0)
-    unit: FoodUnit = "g"
+    unit: str = Field(default="g", min_length=1, max_length=20)
     food_id: int | None = None
     weight: float | None = Field(default=None, gt=0)
     calories: float | None = Field(default=None, ge=0)
@@ -43,7 +43,7 @@ class FoodRecordResponse(BaseModel):
     id: int
     food_name: str
     quantity: float
-    unit: FoodUnit
+    unit: str
     food_id: int | None
     weight: float
     calories: float
@@ -66,6 +66,8 @@ class FoodCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     base_amount: float = Field(default=100, gt=0)
     unit: FoodUnit = "g"
+    serving_unit: str | None = Field(default=None, max_length=20)
+    serving_weight_g: float | None = Field(default=None, gt=0)
     protein: float | None = Field(default=None, ge=0)
     fat: float | None = Field(default=None, ge=0)
     carbs: float | None = Field(default=None, ge=0)
@@ -86,6 +88,28 @@ class FoodCreate(BaseModel):
             raise ValueError("食物名称不能为空")
         return value
 
+    @field_validator("serving_unit", mode="before")
+    @classmethod
+    def normalize_serving_unit(cls, value):
+        if value is None:
+            return None
+        value = str(value).strip()
+        return value or None
+
+    @model_validator(mode="after")
+    def validate_serving(self):
+        if self.serving_unit and self.serving_weight_g is None:
+            raise ValueError("填写常用单位时，每单位重量必须大于 0")
+        if not self.serving_unit and self.serving_weight_g is not None:
+            raise ValueError("填写每单位重量时，必须同时填写常用单位")
+        if self.serving_unit and self.unit != "g":
+            raise ValueError("常用单位换算仅适用于按 100g 保存的食物")
+        if self.serving_unit and self.base_amount != 100:
+            raise ValueError("配置常用单位时，基准数量必须为 100g")
+        if self.serving_unit == "g":
+            raise ValueError("常用单位不能与 g 相同")
+        return self
+
 
 class FoodResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
@@ -94,6 +118,8 @@ class FoodResponse(BaseModel):
     normalized_name: str
     base_amount: float
     unit: FoodUnit
+    serving_unit: str | None
+    serving_weight_g: float | None
     calories: float
     protein: float
     fat: float
@@ -157,7 +183,7 @@ class AIParseRequest(BaseModel):
 class AIParsedItem(BaseModel):
     food_name: str
     quantity: float | None
-    unit: FoodUnit
+    unit: str = Field(min_length=1, max_length=20)
     weight: float | None = None
     meal_type: MealType
     eaten_at: datetime | None
