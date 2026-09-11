@@ -90,8 +90,9 @@ def test_edit_library_quantity_recalculates(client):
 def test_serving_unit_conversion_and_history_snapshot(client):
     food = client.post("/api/foods", json=food_payload(
         "常用单位食物", protein=10, fat=5, carbs=20,
-        serving_unit="个", serving_weight_g=30,
+        common_unit="个", common_unit_amount=30,
     )).json()
+    assert food["common_unit"] == "个" and food["common_unit_amount"] == 30
     assert food["serving_unit"] == "个" and food["serving_weight_g"] == 30
 
     two = client.post("/api/records", json=record_payload(
@@ -115,7 +116,7 @@ def test_serving_unit_conversion_and_history_snapshot(client):
 
     changed_food = client.put(f"/api/foods/{food['id']}", json=food_payload(
         food["name"], protein=10, fat=5, carbs=20,
-        serving_unit="个", serving_weight_g=35,
+        common_unit="个", common_unit_amount=35,
     ))
     assert changed_food.status_code == 200
     preserved = {item["id"]: item for item in client.get("/api/records").json()}[two["id"]]
@@ -123,11 +124,44 @@ def test_serving_unit_conversion_and_history_snapshot(client):
 
 
 def test_serving_unit_validation(client):
-    missing_weight = client.post("/api/foods", json=food_payload("缺重量", serving_unit="片"))
-    zero_weight = client.post("/api/foods", json=food_payload("零重量", serving_unit="片", serving_weight_g=0))
-    orphan_weight = client.post("/api/foods", json=food_payload("缺单位", serving_weight_g=12))
-    wrong_base = client.post("/api/foods", json=food_payload("错误基准", base=50, serving_unit="片", serving_weight_g=12))
+    missing_weight = client.post("/api/foods", json=food_payload("缺数量", common_unit="片"))
+    zero_weight = client.post("/api/foods", json=food_payload("零数量", common_unit="片", common_unit_amount=0))
+    orphan_weight = client.post("/api/foods", json=food_payload("缺单位", common_unit_amount=12))
+    wrong_base = client.post("/api/foods", json=food_payload("错误基准", base=50, common_unit="片", common_unit_amount=12))
     assert missing_weight.status_code == zero_weight.status_code == orphan_weight.status_code == wrong_base.status_code == 422
+
+
+def test_ml_common_unit_conversion_and_legacy_fields(client):
+    beer = client.post("/api/foods", json=food_payload(
+        "瓶装啤酒", unit="ml", base=100, protein=0, fat=0, carbs=4,
+        common_unit="瓶", common_unit_amount=500, alcohol_abv=5,
+    ))
+    assert beer.status_code == 201
+    food = beer.json()
+    assert (food["common_unit"], food["common_unit_amount"], food["unit"]) == ("瓶", 500, "ml")
+
+    record = client.post("/api/records", json=record_payload(
+        name=food["name"], food_id=food["id"], quantity=2, unit="瓶",
+    ))
+    assert record.status_code == 201
+    saved = record.json()
+    assert (saved["quantity"], saved["unit"], saved["weight"], saved["carbs"]) == (2, "瓶", 1000, 40)
+    assert saved["calories"] == pytest.approx(436.15)
+
+    legacy = client.post("/api/foods", json=food_payload(
+        "旧字段鸡蛋", serving_unit="个", serving_weight_g=50,
+    ))
+    assert legacy.status_code == 201
+    legacy_food = legacy.json()
+    assert (legacy_food["common_unit"], legacy_food["common_unit_amount"]) == ("个", 50)
+
+
+def test_food_without_common_unit(client):
+    food = client.post("/api/foods", json=food_payload("无常用单位")).json()
+    assert food["common_unit"] is None and food["common_unit_amount"] is None
+    assert client.post("/api/records", json=record_payload(
+        name=food["name"], food_id=food["id"], quantity=50, unit="g",
+    )).status_code == 201
 
 
 def test_explicit_null_food_id_unlinks_library_record(client):

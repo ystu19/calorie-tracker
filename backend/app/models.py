@@ -38,6 +38,7 @@ class Food(Base):
     alcohol_abv: Mapped[float] = mapped_column(Float, nullable=False, default=0)
     base_amount: Mapped[float] = mapped_column(Float, nullable=False, default=100)
     unit: Mapped[str] = mapped_column(String(10), nullable=False, default="g")
+    # Legacy column names retained: values mean one common unit equals this many base units (g or ml).
     serving_unit: Mapped[str | None] = mapped_column(String(20), nullable=True)
     serving_weight_g: Mapped[float | None] = mapped_column(Float, nullable=True)
     # Legacy column retained for SQLite compatibility; application logic does not use it.

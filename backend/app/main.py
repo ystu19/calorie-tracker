@@ -154,6 +154,7 @@ def food_to_response(food: Food) -> dict:
     return {
         "id": food.id, "name": food.name, "normalized_name": food.normalized_name,
         "base_amount": food.base_amount, "unit": food.unit,
+        "common_unit": food.serving_unit, "common_unit_amount": food.serving_weight_g,
         "serving_unit": food.serving_unit, "serving_weight_g": food.serving_weight_g,
         "calories": food.calories_per_100g, "protein": food.protein_per_100g,
         "fat": food.fat_per_100g, "carbs": food.carbs_per_100g, "alcohol_abv": food.alcohol_abv,
@@ -170,8 +171,8 @@ def apply_food_payload(food: Food, payload: FoodCreate) -> None:
     food.normalized_name = normalize_food_name(payload.name)
     food.base_amount = payload.base_amount
     food.unit = payload.unit
-    food.serving_unit = payload.serving_unit
-    food.serving_weight_g = payload.serving_weight_g
+    food.serving_unit = payload.common_unit
+    food.serving_weight_g = payload.common_unit_amount
     food.protein_per_100g = protein
     food.fat_per_100g = fat
     food.carbs_per_100g = carbs
@@ -188,8 +189,8 @@ def find_food_by_name(db: Session, name: str) -> Food | None:
 
 def food_quantity_ratio(food: Food, quantity: float, unit: str) -> tuple[float, float]:
     if food.serving_unit and unit == food.serving_unit:
-        actual_weight_g = quantity * float(food.serving_weight_g or 0)
-        return actual_weight_g / 100, actual_weight_g
+        actual_base_amount = quantity * float(food.serving_weight_g or 0)
+        return actual_base_amount / food.base_amount, actual_base_amount
     if unit == food.unit:
         ratio = quantity / food.base_amount
         return ratio, quantity
@@ -224,7 +225,7 @@ def record_values(payload: FoodRecordCreate, db: Session) -> dict:
         "weight": actual_weight,
         "food_id": food.id if food else None, "protein": round(protein, 2),
         "fat": round(fat, 2), "carbs": round(carbs, 2), "alcohol_abv": alcohol_abv,
-        "calories": total_calories(protein, fat, carbs, quantity, payload.unit, alcohol_abv), "nutrition_source": source,
+        "calories": total_calories(protein, fat, carbs, actual_weight, food.unit, alcohol_abv) if food else total_calories(protein, fat, carbs, quantity, payload.unit, alcohol_abv), "nutrition_source": source,
         "meal_type": payload.meal_type, "eaten_at": payload.eaten_at,
     }
     if not food and payload.add_to_library and (protein > 0 or fat > 0 or carbs > 0 or alcohol_abv > 0):
@@ -238,7 +239,7 @@ def record_values(payload: FoodRecordCreate, db: Session) -> dict:
                 "fat": round(existing.fat_per_100g * ratio, 2),
                 "carbs": round(existing.carbs_per_100g * ratio, 2),
                 "alcohol_abv": existing.alcohol_abv,
-                "calories": total_calories(existing.protein_per_100g * ratio, existing.fat_per_100g * ratio, existing.carbs_per_100g * ratio, quantity, payload.unit, existing.alcohol_abv),
+                "calories": total_calories(existing.protein_per_100g * ratio, existing.fat_per_100g * ratio, existing.carbs_per_100g * ratio, actual_weight, existing.unit, existing.alcohol_abv),
             })
             values["food_id"] = existing.id
             values["nutrition_source"] = "food_library"
@@ -509,7 +510,7 @@ def ai_parse(payload: AIParseRequest, db: Session = Depends(get_db)):
             items.append(AIParsedItem(
                 food_name=name, quantity=quantity, weight=actual_weight, unit=unit,
                 meal_type=meal_type, eaten_at=eaten_at, matched=food is not None,
-                food_id=food.id if food else None, calories=total_calories(protein, fat, carbs, quantity or 0, unit, alcohol_abv),
+                food_id=food.id if food else None, calories=total_calories(protein, fat, carbs, (actual_weight or 0) if food else (quantity or 0), food.unit if food else unit, alcohol_abv),
                 protein=round(protein, 2), fat=round(fat, 2), carbs=round(carbs, 2), alcohol_abv=alcohol_abv, nutrition_source=source,
             ))
         except (TypeError, ValueError, ArithmeticError):
